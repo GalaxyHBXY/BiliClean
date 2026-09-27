@@ -68,10 +68,10 @@ static UITableViewCell *BLCFeatureCell(UITableViewCellStyle style) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) {
-        return @"测速全程匿名。每个 CDN 最多读取 2 MiB，完整测试最多约 38 MiB。";
+        return @"优先使用最近播放视频的地址测速；没有可用地址时使用备用 BV 号。若提示 HTTP 412，请先播放一个普通视频再来测速。逐个测速全部候选 CDN，按下载速度排序。每个节点最多读取约 2 MiB 媒体数据；403/404 时会尝试备用样本。";
     }
     if (section == 1) {
-        return @"第 1 名用于 base_url，第 2、3 名依次用于 backup_url。";
+        return @"优先使用所选节点中该视频实际提供的地址，并保留原始备用地址。";
     }
     return nil;
 }
@@ -89,7 +89,7 @@ static UITableViewCell *BLCFeatureCell(UITableViewCellStyle style) {
             cell.accessoryView = toggle;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else if (indexPath.row == 1) {
-            cell.textLabel.text = @"测速 BV 号";
+            cell.textLabel.text = @"备用测速 BV 号";
             cell.detailTextLabel.text = manager.sampleBVID;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else {
@@ -203,8 +203,8 @@ moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath
 
 - (void)editSampleBVID {
     BLCCDNManager *manager = [BLCCDNManager sharedManager];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"测速 BV 号"
-                                                                   message:@"使用公开视频，不需要登录。"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"备用测速 BV 号"
+                                                                   message:@"没有最近播放的有效地址时使用。请选择公开视频；匿名接口可能受风控限制。"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = manager.sampleBVID;
@@ -225,7 +225,7 @@ moveRowAtIndexPath:(NSIndexPath *)sourceIndexPath
 
 - (void)startSpeedTest {
     self.liveResults = [NSMutableDictionary dictionary];
-    self.progressText = @"正在获取匿名播放地址…";
+    self.progressText = @"正在准备测速地址…";
     [self.tableView reloadData];
     __weak typeof(self) weakSelf = self;
     [[BLCCDNManager sharedManager] startSpeedTestWithProgress:^(NSUInteger completed,

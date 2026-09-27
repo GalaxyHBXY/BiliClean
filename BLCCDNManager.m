@@ -1,6 +1,7 @@
 #import "BLCCDNManager.h"
 #import "BLCCDNSpeedProbe.h"
 #import <objc/message.h>
+#import <objc/runtime.h>
 
 NSString *const BLCCDNConfigurationDidChangeNotification = @"BLCCDNConfigurationDidChangeNotification";
 NSString *const BLCCDNSpeedTestDidUpdateNotification = @"BLCCDNSpeedTestDidUpdateNotification";
@@ -9,7 +10,8 @@ static NSString *const BLCCDNEnabledKey = @"blc.cdn.enabled";
 static NSString *const BLCCDNSampleBVIDKey = @"blc.cdn.sample.bvid";
 static NSString *const BLCCDNSelectedHostsKey = @"blc.cdn.selected.hosts";
 static NSString *const BLCCDNSpeedsKey = @"blc.cdn.last.speeds";
-static NSString *const BLCCDNDefaultBVID = @"BV1fK4y1t7hj";
+static NSString *const BLCCDNDefaultBVID = @"BV1tFZZBQE57";
+static const char BLCCDNSampleCapturedKey;
 
 static NSError *BLCCDNError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:@"com.imlr.biliclean.cdn"
@@ -55,33 +57,35 @@ static BOOL BLCModelHasMessage(id object, NSString *propertyName) {
     return BLCGetModelValue(object, propertyName) != nil;
 }
 
-static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority) {
-    if (urlString.length == 0 || authority.length == 0) {
-        return urlString;
+// Replace only the authority, leaving the signed path/query byte-for-byte intact.
+static NSString *BLCProbeURLForHost(NSString *url, NSString *host) {
+    NSRange scheme = [url rangeOfString:@"://"];
+    if (!url.length || scheme.location == NSNotFound || !host.length) return nil;
+    NSUInteger start = NSMaxRange(scheme);
+    NSRange suffix = [url rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"/?#"]
+                                         options:0 range:NSMakeRange(start, url.length - start)];
+    if (suffix.location == NSNotFound) return nil;
+    return [NSString stringWithFormat:@"%@%@%@", [url substringToIndex:start], host, [url substringFromIndex:suffix.location]];
+}
+
+// Preserve signed URLs exactly; different hosts may use different paths and tokens.
+static NSDictionary<NSString *, NSString *> *BLCNativeURLs(NSString *base, NSArray *backups) {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    NSMutableArray *URLs = [NSMutableArray array];
+    if ([base isKindOfClass:NSString.class]) [URLs addObject:base];
+    if ([backups isKindOfClass:NSArray.class]) [URLs addObjectsFromArray:backups];
+    for (id value in URLs) {
+        if (![value isKindOfClass:NSString.class]) continue;
+        NSURLComponents *url = [NSURLComponents componentsWithString:value];
+        if (![@[@"https", @"http"] containsObject:url.scheme.lowercaseString] || !url.host.length) continue;
+        BOOL expired = NO;
+        for (NSURLQueryItem *q in url.queryItems) {
+            if ([q.name.lowercaseString isEqual:@"deadline"] && q.value.doubleValue > 0 &&
+                q.value.doubleValue <= NSDate.date.timeIntervalSince1970 + 30) expired = YES;
+        }
+        if (!expired && !result[url.host.lowercaseString]) result[url.host.lowercaseString] = value;
     }
-    NSRange schemeRange = [urlString rangeOfString:@"://"];
-    if (schemeRange.location == NSNotFound) {
-        return urlString;
-    }
-    NSString *scheme = [[urlString substringToIndex:schemeRange.location] lowercaseString];
-    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) {
-        return urlString;
-    }
-    NSUInteger authorityStart = NSMaxRange(schemeRange);
-    if (authorityStart >= urlString.length) {
-        return urlString;
-    }
-    NSCharacterSet *terminators = [NSCharacterSet characterSetWithCharactersInString:@"/?#"];
-    NSRange suffixRange = [urlString rangeOfCharacterFromSet:terminators
-                                                    options:0
-                                                      range:NSMakeRange(authorityStart, urlString.length - authorityStart)];
-    NSUInteger authorityEnd = suffixRange.location == NSNotFound ? urlString.length : suffixRange.location;
-    if (authorityEnd <= authorityStart) {
-        return urlString;
-    }
-    NSString *prefix = [urlString substringToIndex:authorityStart];
-    NSString *suffix = [urlString substringFromIndex:authorityEnd];
-    return [NSString stringWithFormat:@"%@%@%@", prefix, authority, suffix];
+    return result;
 }
 
 @interface BLCCDNManager ()
@@ -94,6 +98,13 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
 @property (nonatomic, copy) BLCCDNSpeedCompletionBlock completionBlock;
 @property (nonatomic, copy) NSString *workingSampleURL;
 @property (nonatomic, assign) NSUInteger workingIndex;
+// Signed playback URLs stay in memory only and are never reused indefinitely.
+@property (nonatomic, copy) NSString *recentSampleURL;
+@property (nonatomic, strong) NSDate *recentSampleExpiry;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *recentSampleURLs;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *workingSampleURLs;
+@property (nonatomic, copy) NSArray *workingCandidates;
+@property (atomic, copy) NSArray<NSString *> *discoveredHosts;
 @end
 
 @implementation BLCCDNManager
@@ -132,10 +143,12 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
     static NSArray<NSDictionary<NSString *, NSString *> *> *items = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        // Verified by public VOD Range requests on 2026-09-27; see CDN_VALIDATION.md.
         items = @[
             @{@"name": @"ali（阿里云）", @"host": @"upos-sz-mirrorali.bilivideo.com"},
             @{@"name": @"alib（阿里云）", @"host": @"upos-sz-mirroralib.bilivideo.com"},
             @{@"name": @"alio1（阿里云）", @"host": @"upos-sz-mirroralio1.bilivideo.com"},
+            @{@"name": @"bos（百度云）", @"host": @"upos-sz-mirrorbos.bilivideo.com"},
             @{@"name": @"cos（腾讯云）", @"host": @"upos-sz-mirrorcos.bilivideo.com"},
             @{@"name": @"cosb（腾讯云 VOD）", @"host": @"upos-sz-mirrorcosb.bilivideo.com"},
             @{@"name": @"coso1（腾讯云）", @"host": @"upos-sz-mirrorcoso1.bilivideo.com"},
@@ -147,14 +160,33 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
             @{@"name": @"08ct（华为云）", @"host": @"upos-sz-mirror08ct.bilivideo.com"},
             @{@"name": @"tf_hw（华为云）", @"host": @"upos-tf-all-hw.bilivideo.com"},
             @{@"name": @"tf_tx（腾讯云）", @"host": @"upos-tf-all-tx.bilivideo.com"},
-            @{@"name": @"akamai（海外）", @"host": @"upos-hz-mirrorakam.akamaized.net"},
+            @{@"name": @"akamai-hz（海外）", @"host": @"upos-hz-mirrorakam.akamaized.net"},
             @{@"name": @"aliov（阿里云海外）", @"host": @"upos-sz-mirroraliov.bilivideo.com"},
             @{@"name": @"cosov（腾讯云海外）", @"host": @"upos-sz-mirrorcosov.bilivideo.com"},
-            @{@"name": @"hwov（华为云海外）", @"host": @"upos-sz-mirrorhwov.bilivideo.com"},
-            @{@"name": @"香港 BCache", @"host": @"cn-hk-eq-bcache-01.bilivideo.com"}
+            @{@"name": @"香港 Equinix 01-01", @"host": @"cn-hk-eq-01-01.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-02", @"host": @"cn-hk-eq-01-02.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-03", @"host": @"cn-hk-eq-01-03.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-04", @"host": @"cn-hk-eq-01-04.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-05", @"host": @"cn-hk-eq-01-05.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-06", @"host": @"cn-hk-eq-01-06.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-08", @"host": @"cn-hk-eq-01-08.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-09", @"host": @"cn-hk-eq-01-09.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-10", @"host": @"cn-hk-eq-01-10.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-11", @"host": @"cn-hk-eq-01-11.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-12", @"host": @"cn-hk-eq-01-12.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-13", @"host": @"cn-hk-eq-01-13.bilivideo.com"},
+            @{@"name": @"香港 Equinix 01-14", @"host": @"cn-hk-eq-01-14.bilivideo.com"}
         ];
     });
-    return items;
+    NSMutableArray *all = [items mutableCopy];
+    NSMutableSet *known = [NSMutableSet setWithArray:[items valueForKey:@"host"]];
+    for (NSString *host in self.discoveredHosts) {
+        if (![known containsObject:host]) {
+            [all addObject:@{@"name": [@"播放节点 · " stringByAppendingString:host], @"host": host}];
+            [known addObject:host];
+        }
+    }
+    return all;
 }
 
 - (NSSet<NSString *> *)candidateHostSet {
@@ -287,7 +319,11 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
             ? ((NSHTTPURLResponse *)response).statusCode
             : 0;
         if (status < 200 || status >= 300 || data.length == 0) {
-            completion(nil, BLCCDNError(status, [NSString stringWithFormat:@"HTTP %ld", (long)status]));
+            NSString *stage = [URL.path hasSuffix:@"/view"] ? @"获取视频信息" : @"获取播放地址";
+            NSString *message = status == 412
+                ? [NSString stringWithFormat:@"%@被 B 站风控拒绝（HTTP 412）。请先播放一个普通视频，再返回此页测速。", stage]
+                : [NSString stringWithFormat:@"%@失败（HTTP %ld）。请先播放一个普通视频，再返回此页测速。", stage, (long)status];
+            completion(nil, BLCCDNError(status, message));
             return;
         }
         id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
@@ -323,7 +359,16 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
         self.workingSpeeds = [NSMutableDictionary dictionary];
         self.workingIndex = 0;
         NSUUID *token = self.testToken;
-        [self fetchSampleURLForBVID:[self sampleBVID] token:token];
+        if (self.recentSampleURL.length > 0 && [self.recentSampleExpiry timeIntervalSinceNow] > 0) {
+            self.workingSampleURL = self.recentSampleURL;
+            self.workingSampleURLs = self.recentSampleURLs;
+            self.workingCandidates = [self candidates];
+            [self probeNextCandidateWithToken:token];
+        } else {
+            self.recentSampleURL = nil;
+            self.recentSampleExpiry = nil;
+            [self fetchSampleURLForBVID:[self sampleBVID] token:token];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:BLCCDNSpeedTestDidUpdateNotification object:self];
         });
@@ -365,6 +410,11 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
                         return;
                     }
                     self.workingSampleURL = sampleURL;
+                    NSDictionary *data = playJSON[@"data"];
+                    NSDictionary *media = [data[@"dash"][@"video"] firstObject] ?: [data[@"durl"] firstObject];
+                    self.workingSampleURLs = BLCNativeURLs(sampleURL, media[@"backupUrl"] ?: media[@"backup_url"]);
+                    self.discoveredHosts = [self.workingSampleURLs.allKeys sortedArrayUsingSelector:@selector(compare:)];
+                    self.workingCandidates = [self candidates];
                     [self probeNextCandidateWithToken:token];
                 });
             }];
@@ -387,29 +437,43 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
     return [url isKindOfClass:[NSString class]] ? url : nil;
 }
 
-- (void)probeNextCandidateWithToken:(NSUUID *)token {
-    if (![self.testToken isEqual:token]) {
-        return;
+- (NSArray<NSURL *> *)probeURLsForHost:(NSString *)host {
+    NSMutableArray<NSURL *> *result = [NSMutableArray array];
+    NSMutableArray *sources = [NSMutableArray array];
+    // A native URL is the first choice, but its absence must not skip a CDN.
+    NSString *native = self.workingSampleURLs[host];
+    if (native) [sources addObject:native];
+    if (self.workingSampleURL) [sources addObject:self.workingSampleURL];
+    for (NSString *key in [self.workingSampleURLs.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [sources addObject:self.workingSampleURLs[key]];
     }
-    NSArray *candidates = [self candidates];
+    for (NSString *source in sources) {
+        if (!BLCNativeURLs(source, nil).count) continue;
+        NSString *value = BLCProbeURLForHost(source, host);
+        NSURL *url = value ? [NSURL URLWithString:value] : nil;
+        if (url && ![result containsObject:url]) [result addObject:url];
+        if (result.count == 3) break;
+    }
+    return result;
+}
+
+- (void)probeNextCandidateWithToken:(NSUUID *)token {
+    if (![self.testToken isEqual:token]) return;
+    NSArray *candidates = self.workingCandidates;
     if (self.workingIndex >= candidates.count) {
         [self finishTestWithError:nil token:token];
         return;
     }
-    NSDictionary *candidate = candidates[self.workingIndex];
-    NSString *host = candidate[@"host"];
-    NSString *testURLString = BLCReplaceURLAuthority(self.workingSampleURL, host);
-    NSURL *testURL = [NSURL URLWithString:testURLString];
-    if (!testURL) {
-        self.workingIndex += 1;
-        [self emitProgressForHost:host speed:nil error:@"测试 URL 无效"];
-        [self probeNextCandidateWithToken:token];
+    NSString *host = candidates[self.workingIndex][@"host"];
+    NSArray<NSURL *> *URLs = [self probeURLsForHost:host];
+    if (!URLs.count) {
+        [self finishTestWithError:BLCCDNError(-24, @"测速样本已过期或无效，请重新播放视频后测速") token:token];
         return;
     }
 
     BLCCDNSpeedProbe *probe = [[BLCCDNSpeedProbe alloc] init];
     self.currentProbe = probe;
-    [probe startWithURL:testURL completion:^(NSNumber *speed, NSError *error) {
+    [probe startWithURLs:URLs completion:^(NSNumber *speed, NSError *error) {
         dispatch_async(self.queue, ^{
             if (![self.testToken isEqual:token]) {
                 return;
@@ -427,7 +491,7 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
 
 - (void)emitProgressForHost:(NSString *)host speed:(NSNumber *)speed error:(NSString *)error {
     NSUInteger completed = self.workingIndex;
-    NSUInteger total = [self candidates].count;
+    NSUInteger total = self.workingCandidates.count;
     BLCCDNSpeedProgressBlock progress = self.progressBlock;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (progress) {
@@ -462,6 +526,8 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
     self.currentProbe = nil;
     self.workingSpeeds = nil;
     self.workingSampleURL = nil;
+    self.workingSampleURLs = nil;
+    self.workingCandidates = nil;
     self.progressBlock = nil;
     self.completionBlock = nil;
 
@@ -522,44 +588,86 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
 }
 
 - (void)rewriteMediaItem:(id)item hosts:(NSArray<NSString *> *)hosts {
-    if (!item || hosts.count == 0) {
-        return;
+    if (!item || !hosts.count) return;
+    NSString *baseKey = nil, *backupKey = nil;
+    NSString *base = [self stringValueForKeys:@[@"baseURL", @"baseUrl"] object:item selectedKey:&baseKey];
+    NSArray *backups = [self arrayValueForKeys:@[@"backupURLArray", @"backupUrlArray", @"backupURLsArray"]
+                                      object:item selectedKey:&backupKey];
+    // Only promote an address returned for this media item, keeping all original
+    // alternatives. Never apply another video's CDN signature or change a host.
+    if (!base.length || !backupKey) return;
+    NSMutableArray *original = [NSMutableArray arrayWithObject:base];
+    for (id value in backups) {
+        if ([value isKindOfClass:NSString.class] && ![original containsObject:value]) [original addObject:value];
     }
-    NSString *baseKey = nil;
-    NSString *baseURL = [self stringValueForKeys:@[@"baseURL", @"baseUrl"] object:item selectedKey:&baseKey];
-    if (baseURL.length > 0 && baseKey.length > 0) {
-        BLCSetModelValue(item, baseKey, BLCReplaceURLAuthority(baseURL, hosts[0]));
-    }
-
-    NSString *backupKey = nil;
-    NSArray *backupURLs = [self arrayValueForKeys:@[@"backupURLArray", @"backupUrlArray", @"backupURLsArray"]
-                                           object:item
-                                      selectedKey:&backupKey];
-    if (backupURLs.count == 0 || backupKey.length == 0) {
-        return;
-    }
-    NSMutableArray<NSString *> *rewritten = [NSMutableArray arrayWithCapacity:backupURLs.count];
-    for (NSUInteger index = 0; index < backupURLs.count; index++) {
-        id value = backupURLs[index];
-        if (![value isKindOfClass:[NSString class]]) {
-            [rewritten addObject:value];
-            continue;
+    NSMutableArray *ordered = [NSMutableArray array];
+    for (NSString *host in hosts) {
+        for (NSString *url in original) {
+            if ([[NSURL URLWithString:url].host.lowercaseString isEqual:host] && ![ordered containsObject:url]) {
+                [ordered addObject:url];
+            }
         }
-        NSString *host = hosts[(index + 1) % hosts.count];
-        [rewritten addObject:BLCReplaceURLAuthority(value, host)];
     }
-    if ([backupURLs isKindOfClass:[NSMutableArray class]]) {
-        NSMutableArray *mutable = (NSMutableArray *)backupURLs;
-        [mutable removeAllObjects];
-        [mutable addObjectsFromArray:rewritten];
-        BLCSetModelValue(item, backupKey, mutable);
-    } else {
-        BLCSetModelValue(item, backupKey, rewritten);
+    if (!ordered.count) return;
+    for (NSString *url in original) if (![ordered containsObject:url]) [ordered addObject:url];
+    NSArray *remaining = [ordered subarrayWithRange:NSMakeRange(1, ordered.count - 1)];
+    if (BLCSetModelValue(item, backupKey, [remaining mutableCopy])) {
+        BLCSetModelValue(item, baseKey, ordered.firstObject);
+    }
+}
+
+- (void)captureSampleFromVODInfo:(id)vodInfo reply:(id)reply {
+    // A protobuf reply may pass through the hooks more than once. Never cache
+    // URLs that this manager has already rewritten, or refresh their lifetime.
+    @synchronized (reply) {
+        if (objc_getAssociatedObject(reply, &BLCCDNSampleCapturedKey)) {
+            return;
+        }
+        NSMutableArray *media = [NSMutableArray array];
+        NSArray *streams = [self arrayValueForKeys:@[@"streamListArray", @"streamList"] object:vodInfo selectedKey:nil];
+        for (id stream in streams) {
+            if (BLCModelHasMessage(stream, @"dashVideo")) {
+                id video = BLCGetModelValue(stream, @"dashVideo");
+                if (video) {
+                    [media addObject:video];
+                }
+            }
+        }
+        [media addObjectsFromArray:[self arrayValueForKeys:@[@"dashAudioArray", @"dashAudio"] object:vodInfo selectedKey:nil] ?: @[]];
+        for (id item in media) {
+            NSString *url = [self stringValueForKeys:@[@"baseURL", @"baseUrl"] object:item selectedKey:nil];
+            NSURLComponents *components = url.length ? [NSURLComponents componentsWithString:url] : nil;
+            if (components.host.length == 0 ||
+                ![@[@"https", @"http"] containsObject:components.scheme.lowercaseString]) {
+                continue;
+            }
+            NSTimeInterval expiry = [NSDate date].timeIntervalSince1970 + 5 * 60;
+            for (NSURLQueryItem *query in components.queryItems) {
+                if ([query.name.lowercaseString isEqualToString:@"deadline"] && query.value.doubleValue > 0) {
+                    expiry = MIN(expiry, query.value.doubleValue - 30);
+                }
+            }
+            if (expiry <= [NSDate date].timeIntervalSince1970) {
+                continue;
+            }
+            NSArray *backups = [self arrayValueForKeys:@[@"backupURLArray", @"backupUrlArray", @"backupURLsArray"] object:item selectedKey:nil];
+            NSDictionary *nativeURLs = BLCNativeURLs(url, backups);
+            NSString *sample = [url copy];
+            NSDate *expiresAt = [NSDate dateWithTimeIntervalSince1970:expiry];
+            dispatch_async(self.queue, ^{
+                self.recentSampleURL = sample;
+                self.recentSampleURLs = nativeURLs;
+                self.discoveredHosts = [nativeURLs.allKeys sortedArrayUsingSelector:@selector(compare:)];
+                self.recentSampleExpiry = expiresAt;
+            });
+            break;
+        }
+        objc_setAssociatedObject(reply, &BLCCDNSampleCapturedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
 - (void)rewritePlayViewReply:(id)reply {
-    if (![self isEnabled] || !reply) {
+    if (!reply) {
         return;
     }
     NSString *className = NSStringFromClass([reply class]);
@@ -570,6 +678,13 @@ static NSString *BLCReplaceURLAuthority(NSString *urlString, NSString *authority
         return;
     }
     id vodInfo = BLCGetModelValue(reply, @"vodInfo");
+    if (!vodInfo) {
+        return;
+    }
+    [self captureSampleFromVODInfo:vodInfo reply:reply];
+    if (![self isEnabled]) {
+        return;
+    }
     NSArray<NSString *> *hosts = [self selectedHosts];
     if (!vodInfo || hosts.count == 0) {
         return;

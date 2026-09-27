@@ -18,5 +18,8 @@ docs/
 DETAILS.md
 TODO.md
 tools/
-tests/
+tests/*
+!tests/CDNSampleTests.m
+!tests/CDNProbeTests.m
+!tests/FeedFilterTests.m
 BiliBiliTweak-main/

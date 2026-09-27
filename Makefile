@@ -11,9 +11,9 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = BiliClean
 
-BiliClean_FILES = Tweak.x BLCCDNManager.m BLCCDNSpeedProbe.m BLCTabManager.m BLCFeatureSettingsViewControllers.m $(wildcard Download/*.m)
+BiliClean_FILES = Tweak.x BLCCDNManager.m BLCCDNSpeedProbe.m BLCTabManager.m BLCFeedFilter.m BLCFeatureSettingsViewControllers.m $(wildcard Download/*.m)
 BiliClean_CFLAGS = -fobjc-arc
-BiliClean_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia Photos
+BiliClean_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia CoreGraphics Photos
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

@@ -17,13 +17,28 @@ static NSError *BLCCDNSpeedProbeError(NSInteger code, NSString *message) {
 @property (nonatomic, assign) CFAbsoluteTime startedAt;
 @property (nonatomic, assign) NSInteger statusCode;
 @property (nonatomic, assign) BOOL finished;
+@property (nonatomic, copy) NSArray<NSURL *> *URLs;
+@property (nonatomic, assign) NSUInteger attempt;
 @end
 
 @implementation BLCCDNSpeedProbe
 
 - (void)startWithURL:(NSURL *)URL completion:(BLCCDNSpeedProbeCompletion)completion {
+    [self startWithURLs:@[URL] completion:completion];
+}
+
+- (NSURLSessionConfiguration *)sessionConfiguration {
+    return [NSURLSessionConfiguration ephemeralSessionConfiguration];
+}
+
+- (void)startWithURLs:(NSArray<NSURL *> *)URLs completion:(BLCCDNSpeedProbeCompletion)completion {
     self.completion = completion;
-    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    self.URLs = [URLs subarrayWithRange:NSMakeRange(0, MIN(URLs.count, (NSUInteger)3))];
+    if (!self.URLs.count) {
+        [self finishWithError:BLCCDNSpeedProbeError(-1, @"无有效测速样本")];
+        return;
+    }
+    NSURLSessionConfiguration *configuration = [self sessionConfiguration];
     configuration.timeoutIntervalForRequest = BLCCDNProbeTimeout;
     configuration.timeoutIntervalForResource = BLCCDNProbeTimeout;
     configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -36,14 +51,30 @@ static NSError *BLCCDNSpeedProbeError(NSInteger code, NSString *message) {
     self.session = [NSURLSession sessionWithConfiguration:configuration
                                                  delegate:self
                                             delegateQueue:delegateQueue];
+    [self startNextAttempt];
+}
+
+- (void)startNextAttempt {
+    BOOL webHeaders = self.attempt % 2 != 0;
+    NSURL *URL = self.URLs[self.attempt / 2];
+    self.attempt += 1;
+    self.receivedBytes = 0;
+    self.statusCode = 0;
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL];
     request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     request.timeoutInterval = BLCCDNProbeTimeout;
     [request setValue:@"bytes=0-2097151" forHTTPHeaderField:@"Range"];
-    [request setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-   forHTTPHeaderField:@"User-Agent"];
-    [request setValue:@"https://www.bilibili.com/" forHTTPHeaderField:@"Referer"];
+    if (webHeaders) {
+        [request setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+       forHTTPHeaderField:@"User-Agent"];
+        [request setValue:@"https://www.bilibili.com/" forHTTPHeaderField:@"Referer"];
+    } else {
+        // Match the existing in-app media downloader; web headers remain a
+        // bounded fallback for samples obtained from the anonymous web API.
+        [request setValue:@"Bilibili/8.76.0 (iPhone; iOS 16.7.12; Scale/3.00)" forHTTPHeaderField:@"User-Agent"];
+    }
+    [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
     [request setValue:@"no-cache" forHTTPHeaderField:@"Cache-Control"];
 
     self.startedAt = CFAbsoluteTimeGetCurrent();
@@ -55,24 +86,53 @@ static NSError *BLCCDNSpeedProbeError(NSInteger code, NSString *message) {
           dataTask:(NSURLSessionDataTask *)dataTask
 didReceiveResponse:(NSURLResponse *)response
  completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+    if (self.finished || dataTask != self.task) {
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
     if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
         self.statusCode = ((NSHTTPURLResponse *)response).statusCode;
     }
     if (self.statusCode < 200 || self.statusCode >= 300) {
         completionHandler(NSURLSessionResponseCancel);
+        if ((self.statusCode == 403 || self.statusCode == 404) && self.attempt < self.URLs.count * 2) {
+            [self startNextAttempt];
+            return;
+        }
         [self finishWithError:BLCCDNSpeedProbeError(
             self.statusCode,
-            [NSString stringWithFormat:@"HTTP %ld", (long)self.statusCode]
+            self.statusCode == 403
+                ? @"HTTP 403：节点拒绝所有测速样本，无法测得速度"
+                : [NSString stringWithFormat:@"HTTP %ld", (long)self.statusCode]
         )];
+        return;
+    }
+    NSString *mime = response.MIMEType.lowercaseString;
+    if ([mime hasPrefix:@"text/"] || [mime containsString:@"json"]) {
+        completionHandler(NSURLSessionResponseCancel);
+        [self finishWithError:BLCCDNSpeedProbeError(-4, @"节点返回非媒体内容，无法测得速度")];
         return;
     }
     completionHandler(NSURLSessionResponseAllow);
 }
 
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request
+ completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    if (self.finished || task != self.task) {
+        completionHandler(nil);
+    } else if (![request.URL.host.lowercaseString isEqual:self.URLs.firstObject.host.lowercaseString]) {
+        completionHandler(nil);
+        [self finishWithError:BLCCDNSpeedProbeError(-5, @"节点跳转至其他 CDN，无法归属测速结果")];
+    } else {
+        completionHandler(request);
+    }
+}
+
 - (void)URLSession:(NSURLSession *)session
           dataTask:(NSURLSessionDataTask *)dataTask
     didReceiveData:(NSData *)data {
-    if (self.finished) {
+    if (self.finished || dataTask != self.task) {
         return;
     }
     self.receivedBytes += data.length;
@@ -85,7 +145,7 @@ didReceiveResponse:(NSURLResponse *)response
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
 didCompleteWithError:(NSError *)error {
-    if (self.finished) {
+    if (self.finished || task != self.task) {
         return;
     }
     if (self.receivedBytes >= 64 * 1024 &&

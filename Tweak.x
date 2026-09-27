@@ -11,6 +11,7 @@
 #import <string.h>
 #import "BLCCDNManager.h"
 #import "BLCTabManager.h"
+#import "BLCFeedFilter.h"
 #import "BLCFeatureSettingsViewControllers.h"
 #import "Download/BLCVideoDownloadManager.h"
 
@@ -99,6 +100,11 @@ static NSArray<NSNumber *> *BLCPlayerPlaybackRateOptions(void) {
         BLCPlayerEndPageAdBlockEnabledKey: @YES,
         BLCPlayerFloatingBlockEnabledKey: @YES,
         BLCPruneHomeLiveEnabledKey: @YES,
+        BLCFeedPromotionKey: @YES,
+        BLCFeedMallKey: @YES,
+        BLCFeedAdBadgeKey: @YES,
+        BLCFeedWideKey: @YES,
+        BLCFeedMiniGameKey: @YES,
         BLCPruneDynamicUpAdEnabledKey: @YES,
         BLCPruneDynamicOnlyFansEnabledKey: @YES,
         BLCPruneDynamicLiveRcmdEnabledKey: @YES,
@@ -697,7 +703,7 @@ static BOOL BLCShouldRemoveHomeLiveItem(NSDictionary *dict, NSString *url) {
     if (![BLCSettings featureEnabled:BLCPruneHomeLiveEnabledKey defaultValue:YES]) {
         return NO;
     }
-    if (![url hasSuffix:@"/x/v2/feed/index"]) {
+    if (!BLCIsHomeFeedURL(url)) {
         return NO;
     }
     NSString *description = BLCStringValue(dict[@"cover_right_content_description"]) ?: @"";
@@ -728,6 +734,7 @@ static BOOL BLCShouldRemoveMineItem(NSDictionary *dict) {
 }
 
 static BOOL BLCShouldRemoveDictionary(NSDictionary *dict, NSString *url) {
+    if (BLCIsHomeFeedURL(url)) return NO; // Home cards are filtered once, before mutation.
     if ([url containsString:@"/x/resource/show/tab/v2"]) {
         return NO;
     }
@@ -820,15 +827,12 @@ static void BLCNormalizeFeedStoryURI(NSMutableDictionary *item) {
 }
 
 static void BLCApplyFeedIndexItemMutations(NSMutableDictionary *dict, NSString *url) {
-    if (![url containsString:@"/x/v2/feed/index"]) {
+    if (!BLCIsHomeFeedURL(url)) {
         return;
     }
     BOOL normalizeVerticalMode = [BLCSettings featureEnabled:BLCVerticalBlockEnabledKey defaultValue:YES];
     BOOL removeRecommendReason = [BLCSettings featureEnabled:BLCPruneFeedReasonEnabledKey defaultValue:YES];
     BOOL removePictureItems = [BLCSettings featureEnabled:BLCPruneFeedPictureEnabledKey defaultValue:YES];
-    if (!normalizeVerticalMode && !removeRecommendReason && !removePictureItems) {
-        return;
-    }
     id data = dict[@"data"];
     if (![data isKindOfClass:[NSMutableDictionary class]]) {
         return;
@@ -837,7 +841,7 @@ static void BLCApplyFeedIndexItemMutations(NSMutableDictionary *dict, NSString *
     if (![items isKindOfClass:[NSArray class]]) {
         return;
     }
-    NSMutableArray *keptItems = removePictureItems ? [NSMutableArray arrayWithCapacity:[(NSArray *)items count]] : nil;
+    NSMutableArray *keptItems = [NSMutableArray arrayWithCapacity:[(NSArray *)items count]];
     for (id item in (NSArray *)items) {
         if (![item isKindOfClass:[NSMutableDictionary class]]) {
             if (keptItems) {
@@ -846,10 +850,20 @@ static void BLCApplyFeedIndexItemMutations(NSMutableDictionary *dict, NSString *
             continue;
         }
         NSMutableDictionary *itemDict = item;
+        BLCFeedKind kind = BLCClassifyFeedCard(itemDict);
+        if (BLCShouldHideFeedCard(itemDict, NSUserDefaults.standardUserDefaults) ||
+            (kind == 0 && BLCIsAdDictionary(itemDict)) ||
+            BLCShouldRemoveHomeLiveItem(itemDict, url) ||
+            BLCTextMatchesKeywordRulesForScope(BLCStringValue(itemDict[@"title"]) ?: @"", BLCKeywordScopeRecommend)) {
+            continue;
+        }
         if (removePictureItems && BLCFeedItemIsPicture(itemDict)) {
             continue;
         }
-        if (normalizeVerticalMode) {
+        NSString *originalGoto = BLCStringValue(itemDict[@"goto"]) ?: @"";
+        NSString *originalURI = BLCStringValue(itemDict[@"uri"]) ?: @"";
+        if (normalizeVerticalMode && ([originalGoto isEqual:@"av"] || [originalGoto isEqual:@"vertical_av"] ||
+                                      [originalURI hasPrefix:@"bilibili://story/"])) {
             itemDict[@"goto"] = @"av";
             itemDict[@"card_goto"] = @"av";
             BLCNormalizeFeedStoryURI(itemDict);
@@ -914,6 +928,7 @@ static void BLCProcessJSONObject(id object, NSString *url) {
     if ([object isKindOfClass:[NSMutableDictionary class]]) {
         NSMutableDictionary *dict = object;
         BLCApplyEndpointMutations(dict, url);
+        if (BLCIsHomeFeedURL(url)) return; // Preserve retained card metadata and independent switches.
         for (id key in [dict allKeys]) {
             id value = dict[key];
             if ([value isKindOfClass:[NSMutableArray class]]) {
@@ -1821,8 +1836,8 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
     if (section == 0) return 1;
     if (section == 1) return 6;
     if (section == 2) return 11;
-    if (section == 3) return 4;
-    if (section == 4) return 3;
+    if (section == 3) return 9;
+    if (section == 4) return 4;
     if (section == 5) return 2;
     return 0;
 }
@@ -1914,13 +1929,23 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
             @"移除视频推荐理由",
             @"移除首页图文推荐",
             @"移除首页直播推荐",
-            @"屏蔽竖屏模式"
+            @"屏蔽竖屏模式",
+            @"移除创作推广卡片",
+            @"移除会员购卡片",
+            @"移除广告角标卡片",
+            @"移除跨两列大卡片",
+            @"移除小游戏/广告"
         ];
         NSArray *keys = @[
             BLCPruneFeedReasonEnabledKey,
             BLCPruneFeedPictureEnabledKey,
             BLCPruneHomeLiveEnabledKey,
-            BLCVerticalBlockEnabledKey
+            BLCVerticalBlockEnabledKey,
+            BLCFeedPromotionKey,
+            BLCFeedMallKey,
+            BLCFeedAdBadgeKey,
+            BLCFeedWideKey,
+            BLCFeedMiniGameKey
         ];
         NSString *key = keys[indexPath.row];
         cell.textLabel.text = titles[indexPath.row];
@@ -1938,6 +1963,10 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
                 ? [NSString stringWithFormat:@"%lu/%lu 显示", (unsigned long)tabManager.visibleItemCount, (unsigned long)tabManager.totalItemCount]
                 : @"等待配置";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else if (indexPath.row == 3) {
+            cell.textLabel.text = @"隐藏底部会员购";
+            cell.accessoryView = BLCSwitch([[BLCTabManager sharedManager] hideMallTab], self, @selector(switchChanged:), BLCHideMallTabEnabledKey);
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else {
             cell.textLabel.text = @"移除不常用服务";
             cell.accessoryView = BLCSwitch([BLCSettings boolForKey:BLCPruneUnusedServicesEnabledKey defaultValue:YES], self, @selector(switchChanged:), BLCPruneUnusedServicesEnabledKey);
@@ -1955,6 +1984,11 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
         }
     }
     return cell;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 3) return @"开关开启即移除对应卡片，下拉刷新首页后生效。多个条件同时命中时，任一对应开关开启都会移除。仅识别角标与布局，不按标题关键词判断。";
+    return nil;
 }
 
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
@@ -1982,6 +2016,7 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    if (section == 3) return UITableViewAutomaticDimension;
     if (section == 4) {
         return 64.0;
     }
@@ -1989,6 +2024,14 @@ static UISwitch *BLCSwitch(BOOL on, id target, SEL action, NSString *key) {
 }
 
 - (void)switchChanged:(UISwitch *)sender {
+    if ([sender.accessibilityIdentifier isEqual:BLCHideMallTabEnabledKey]) {
+        [[BLCTabManager sharedManager] setHideMallTab:sender.isOn];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"会员购 Tab 设置已保存"
+            message:@"退出并重新打开哔哩哔哩后生效。" preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     [BLCSettings setBool:sender.isOn forKey:sender.accessibilityIdentifier];
 }
 
@@ -2235,6 +2278,37 @@ static void BLCInstallSettingsEntry(UIViewController *controller) {
 
 @protocol BFCApiMetrics <NSObject>
 @end
+
+%group BLCNetworkCompletionHooks
+%hook BFCRequest
+- (void)handleFinishCallbackWithData:(NSData *)data response:(NSURLResponse *)response error:(NSError *)error {
+    if (data && !error && response.URL) {
+        [[BLCDebugServer sharedServer] emitJSONData:data URL:response.URL];
+        data = BLCFilteredJSONData(data, response);
+    }
+    %orig(data, response, error);
+}
+%end
+%end
+
+%group BLCBottomControllerHooks
+%hook BBPhoneTabBarControllerV2
+- (void)configTabBarChildVCSWithRootsData:(id)data {
+    %orig([[BLCTabManager sharedManager] filteredBottomItems:data]);
+}
+- (void)updateRoutesWithDataArr:(id)data {
+    %orig([[BLCTabManager sharedManager] filteredBottomItems:data]);
+}
+%end
+%end
+
+%group BLCBottomBarHooks
+%hook BBPhoneTabBar
+- (void)setItems:(id)items {
+    %orig([[BLCTabManager sharedManager] filteredBottomItems:items]);
+}
+%end
+%end
 
 %group BLCNetworkHooks
 
@@ -2636,8 +2710,19 @@ static void BLCInstallSettingsEntry(UIViewController *controller) {
     if ([BLCSettings boolForKey:BLCDebugEnabledKey defaultValue:NO]) {
         [[BLCDebugServer sharedServer] start];
     }
-    if (objc_getClass("BFCRequest")) {
+    Class requestClass = objc_getClass("BFCRequest");
+    if (class_getInstanceMethod(requestClass, @selector(handleFinishCallbackWithData:response:error:))) {
+        %init(BLCNetworkCompletionHooks);
+    } else if (class_getInstanceMethod(requestClass, NSSelectorFromString(@"initWithRequest:taskType:priority:progressHandler:metricsHandler:completionHandler:"))) {
         %init(BLCNetworkHooks);
+    }
+    Class bottomController = objc_getClass("BBPhoneTabBarControllerV2");
+    if (class_getInstanceMethod(bottomController, @selector(configTabBarChildVCSWithRootsData:)) &&
+        class_getInstanceMethod(bottomController, @selector(updateRoutesWithDataArr:))) {
+        %init(BLCBottomControllerHooks);
+    }
+    if (class_getInstanceMethod(objc_getClass("BBPhoneTabBar"), @selector(setItems:))) {
+        %init(BLCBottomBarHooks);
     }
     if (objc_getClass("BFCSplashLaunchInfo")) {
         %init(BLCSplashHooks);

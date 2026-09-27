@@ -8,6 +8,7 @@ typedef void (^BLCCDNSpeedProbeCompletion)(NSNumber * _Nullable megabytesPerSeco
 @interface BLCCDNSpeedProbe : NSObject
 
 - (void)startWithURL:(NSURL *)URL completion:(BLCCDNSpeedProbeCompletion)completion;
+- (void)startWithURLs:(NSArray<NSURL *> *)URLs completion:(BLCCDNSpeedProbeCompletion)completion;
 - (void)cancel;
 
 @end

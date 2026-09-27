@@ -1,6 +1,24 @@
 #import "BLCTabManager.h"
 
 NSString *const BLCTabConfigurationDidChangeNotification = @"BLCTabConfigurationDidChangeNotification";
+NSString *const BLCHideMallTabEnabledKey = @"blc.tab.hide.mall";
+
+static id BLCTabValue(id item, NSString *key) {
+    if ([item isKindOfClass:NSDictionary.class]) return item[key];
+    if (![item respondsToSelector:NSSelectorFromString(key)]) return nil;
+    @try { return [item valueForKey:key]; } @catch (__unused NSException *exception) { return nil; }
+}
+
+static BOOL BLCTabIsMall(id item) {
+    if ([BLCTabValue(item, @"name") isEqual:@"会员购"] ||
+        [BLCTabValue(item, @"title") isEqual:@"会员购"] ||
+        [BLCTabValue(item, @"tab_id") isEqual:@"会员购Bottom"]) return YES;
+    id uri = BLCTabValue(item, @"uri");
+    if (![uri isKindOfClass:NSString.class]) return NO;
+    NSURLComponents *url = [NSURLComponents componentsWithString:uri];
+    return [url.host.lowercaseString isEqual:@"mall.bilibili.com"] ||
+        ([url.scheme.lowercaseString isEqual:@"bilibili"] && [url.host.lowercaseString isEqual:@"mall"]);
+}
 
 static NSString *const BLCTabCachedItemsKey = @"blc.tab.cached.items";
 static NSString *const BLCTabCachedResponseKey = @"blc.tab.cached.response";
@@ -84,7 +102,8 @@ static void BLCRemoveAlwaysHiddenTabItems(id object) {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         BLCTabCachedItemsKey: @[],
         BLCTabHiddenIDsKey: @[],
-        BLCTabKeywordsKey: @[]
+        BLCTabKeywordsKey: @[],
+        BLCHideMallTabEnabledKey: @YES
     }];
 }
 
@@ -167,10 +186,46 @@ static void BLCRemoveAlwaysHiddenTabItems(id object) {
 }
 
 - (BOOL)isTabVisible:(NSString *)tabID {
+    if ([self hideMallTab] && [self isMallTabID:tabID]) return NO;
     return tabID.length > 0 && ![[self hiddenTabIDs] containsObject:tabID];
 }
 
+- (BOOL)isMallTabID:(NSString *)tabID {
+    if ([tabID isEqual:@"会员购Bottom"]) return YES;
+    for (NSDictionary *item in [self cachedItems]) {
+        if ([item[@"group"] isEqual:@"bottom"] && [item[@"tab_id"] isEqual:tabID] && BLCTabIsMall(item)) return YES;
+    }
+    return NO;
+}
+
+- (BOOL)hideMallTab {
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:BLCHideMallTabEnabledKey];
+    return value ? [value boolValue] : YES;
+}
+
+- (void)setHideMallTab:(BOOL)hidden {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setBool:hidden forKey:BLCHideMallTabEnabledKey];
+    // The dedicated switch and the generic TAB selector share one decision.
+    NSMutableSet *IDs = [[self hiddenTabIDs] mutableCopy];
+    for (NSString *tabID in [IDs copy]) if ([self isMallTabID:tabID]) [IDs removeObject:tabID];
+    [defaults setObject:IDs.allObjects forKey:BLCTabHiddenIDsKey];
+    [[NSNotificationCenter defaultCenter] postNotificationName:BLCTabConfigurationDidChangeNotification object:self];
+}
+
+- (id)filteredBottomItems:(id)items {
+    id master = [NSUserDefaults.standardUserDefaults objectForKey:@"blc.master.enabled"];
+    if ((master && ![master boolValue]) || ![self hideMallTab] || ![items isKindOfClass:NSArray.class]) return items;
+    NSMutableArray *kept = [NSMutableArray array];
+    for (id item in items) if (!BLCTabIsMall(item)) [kept addObject:item];
+    return kept.count == [items count] ? items : kept;
+}
+
 - (void)setTabID:(NSString *)tabID visible:(BOOL)visible {
+    if ([self isMallTabID:tabID]) {
+        [self setHideMallTab:!visible];
+        return;
+    }
     if (tabID.length == 0) {
         return;
     }
@@ -326,6 +381,8 @@ static void BLCRemoveAlwaysHiddenTabItems(id object) {
         [self cacheRootDictionary:[root copy]];
     }
     NSMutableDictionary *data = dataValue;
+    id master = [NSUserDefaults.standardUserDefaults objectForKey:@"blc.master.enabled"];
+    if (master && ![master boolValue]) return;
     BLCRemoveAlwaysHiddenTabItems(data);
     NSSet<NSString *> *hidden = [self hiddenTabIDs];
     NSArray<NSString *> *keywords = [self tabKeywords];
@@ -340,6 +397,7 @@ static void BLCRemoveAlwaysHiddenTabItems(id object) {
                 [kept addObject:item];
                 continue;
             }
+            if ([group isEqual:@"bottom"] && [self hideMallTab] && BLCTabIsMall(item)) continue;
             if (BLCTabItemMatchesKeywords(item, keywords)) {
                 continue;
             }

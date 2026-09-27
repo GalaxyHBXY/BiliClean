@@ -3,6 +3,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 FOUNDATION_EXPORT NSString *const BLCTabConfigurationDidChangeNotification;
+FOUNDATION_EXPORT NSString *const BLCHideMallTabEnabledKey;
 
 @interface BLCTabManager : NSObject
 
@@ -14,6 +15,9 @@ FOUNDATION_EXPORT NSString *const BLCTabConfigurationDidChangeNotification;
 - (NSDate * _Nullable)lastUpdatedAt;
 - (BOOL)isTabVisible:(NSString *)tabID;
 - (void)setTabID:(NSString *)tabID visible:(BOOL)visible;
+- (BOOL)hideMallTab;
+- (void)setHideMallTab:(BOOL)hidden;
+- (id)filteredBottomItems:(id)items;
 - (NSArray<NSString *> *)tabKeywords;
 - (void)setTabKeywords:(NSArray<NSString *> *)keywords;
 - (NSUInteger)visibleItemCount;
